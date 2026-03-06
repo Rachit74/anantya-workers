@@ -1,7 +1,8 @@
 import os
+import asyncio
 import psycopg2
+import aiosmtplib
 from dotenv import load_dotenv
-import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -21,15 +22,16 @@ def log_warn(msg):    print(f"{YELLOW}{BOLD}[WARN]{RESET}    {YELLOW}{msg}{RESET
 def log_info(msg):    print(f"{CYAN}{BOLD}[INFO]{RESET}    {msg}")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-sender_email = "rachithooda09@gmail.com"
-app_password = os.getenv('MAIL_APP_PASSWORD')
-subject      = "Anantya Foundation Onboarding"
-conn_string  = os.getenv('DATABASE_URL')
+SENDER_EMAIL   = "rachithooda09@gmail.com"
+APP_PASSWORD   = os.getenv('MAIL_APP_PASSWORD')
+SUBJECT        = "Anantya Foundation Onboarding"
+CONN_STRING    = os.getenv('DATABASE_URL')
+MAX_CONCURRENT = 5  # max emails sent at the same time
 
 sql = "SELECT * FROM members WHERE email_sent = FALSE;"
 
-# ── Email ──────────────────────────────────────────────────────────────────────
-def send_onboarding_email(recipient_email, member_data):
+# ── Build Email HTML ───────────────────────────────────────────────────────────
+def build_email(recipient_email, member_data):
     html_body = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -178,40 +180,66 @@ def send_onboarding_email(recipient_email, member_data):
     """
 
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From']    = sender_email
+    msg['Subject'] = SUBJECT
+    msg['From']    = SENDER_EMAIL
     msg['To']      = recipient_email
     msg.attach(MIMEText(html_body, 'html'))
+    return msg
 
+
+# ── DB Update (sync is fine here — fast query) ─────────────────────────────────
+def update_email_status(member_id):
+    update_sql = "UPDATE members SET email_sent = TRUE WHERE member_id = %s;"
     try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(sender_email, app_password)
-            server.send_message(msg)
-        log_success(f"Email sent to {recipient_email}")
-        return True
-    except Exception as e:
-        log_error(f"Failed to send email to {recipient_email}: {e}")
-        return False
-
-
-# ── DB Update ──────────────────────────────────────────────────────────────────
-def update_email_status(member_id, status=True):
-    update_sql = "UPDATE members SET email_sent = %s WHERE member_id = %s;"
-    try:
-        with psycopg2.connect(conn_string) as conn:
+        with psycopg2.connect(CONN_STRING) as conn:
             with conn.cursor() as cur:
-                cur.execute(update_sql, (status, member_id))
+                cur.execute(update_sql, (member_id,))
                 conn.commit()
         log_info(f"Marked email_sent=True for member ID: {member_id}")
     except Exception as e:
         log_error(f"Failed to update email status for {member_id}: {e}")
 
 
+# ── Async Send (with Semaphore) ────────────────────────────────────────────────
+async def send_onboarding_email(member, semaphore):
+    name  = member.get('fullname', 'Unknown')
+    email = member.get('email')
+
+    print(f"\n{BOLD}── Processing: {name} ──{RESET}")
+    log_info(f"Email: {email}")
+
+    if not email:
+        log_warn(f"No email for {name}, skipping.")
+        return
+
+    msg = build_email(email, member)
+
+    # acquire semaphore — only MAX_CONCURRENT tasks pass through at once
+    # the rest wait here until a slot opens up
+    async with semaphore:
+        try:
+            await aiosmtplib.send(
+                msg,
+                hostname="smtp.gmail.com",
+                port=465,
+                username=SENDER_EMAIL,
+                password=APP_PASSWORD,
+                use_tls=True,
+            )
+            log_success(f"Email sent to {email}")
+            # only mark as sent AFTER confirmed success
+            if 'member_id' in member:
+                update_email_status(member['member_id'])
+        except Exception as e:
+            log_error(f"Failed to send email to {email}: {e}")
+            # email_sent stays False — will retry on next run
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
-def main():
+async def main():
     log_info("Starting email polling run...")
     try:
-        with psycopg2.connect(conn_string) as conn:
+        with psycopg2.connect(CONN_STRING) as conn:
             log_success("Connected to database")
 
             with conn.cursor() as cur:
@@ -225,26 +253,21 @@ def main():
 
                 log_info(f"Found {len(records)} member(s) to process")
 
-                for row in records:
-                    member = dict(zip(colnames, row))
-                    name   = member.get('fullname', 'Unknown')
-                    email  = member.get('email')
-
-                    print(f"\n{BOLD}── Processing: {name} ──{RESET}")
-                    log_info(f"Email: {email}")
-
-                    if not email:
-                        log_warn(f"No email for {name}, skipping.")
-                        continue
-
-                    success = send_onboarding_email(email, member)
-
-                    if success and 'member_id' in member:
-                        update_email_status(member['member_id'])
+                members = [dict(zip(colnames, row)) for row in records]
 
     except Exception as e:
         log_error(f"Database connection error: {e}")
+        return
+
+    # semaphore created once, shared across all tasks
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+    # all tasks fire at once — semaphore controls how many run simultaneously
+    tasks = [send_onboarding_email(m, semaphore) for m in members]
+    await asyncio.gather(*tasks)
+
+    log_info("All tasks completed.")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
