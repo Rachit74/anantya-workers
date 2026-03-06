@@ -5,6 +5,7 @@ import aiosmtplib
 from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import time
 
 load_dotenv()
 
@@ -270,4 +271,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    while True:
+      asyncio.run(main())
+      # check for new records every 5 minutes
+      time.sleep(500)
